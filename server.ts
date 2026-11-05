@@ -152,7 +152,8 @@ async function translateTextFree(text: string, targetLang: string, sourceLang?: 
 // ==========================================
 // File-Backed Server State (100% Free, Multi-Device)
 // ==========================================
-const DATA_DIR = path.resolve(__dirname, 'data');
+const IS_SERVERLESS = Boolean(process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const DATA_DIR = IS_SERVERLESS ? '/tmp/togetheron_data' : path.resolve(__dirname, 'data');
 const STATE_FILE = path.resolve(DATA_DIR, 'togetheron_store.json');
 
 interface ServerStoreData {
@@ -273,6 +274,27 @@ app.get('/api/health', (_req: Request, res: Response) => {
 // Teacher Authentication Endpoints
 // ==========================================
 
+function getAuthSecret(): string {
+  return process.env.TEACHER_AUTH_SECRET || process.env.GEMINI_API_KEY || serverStore.teacherSalt || 'togetheron-hmac-secret';
+}
+
+function createSignedTeacherToken(): string {
+  const payload = `teacher.${Date.now()}.${crypto.randomBytes(8).toString('hex')}`;
+  const sig = crypto.createHmac('sha256', getAuthSecret()).update(payload).digest('hex');
+  return `${payload}.${sig}`;
+}
+
+function verifySignedTeacherToken(token?: string): boolean {
+  if (!token) return false;
+  if (activeTeacherTokens.has(token)) return true;
+  const parts = token.split('.');
+  if (parts.length !== 4 || parts[0] !== 'teacher') return false;
+  const payload = `${parts[0]}.${parts[1]}.${parts[2]}`;
+  const sig = parts[3];
+  const expected = crypto.createHmac('sha256', getAuthSecret()).update(payload).digest('hex');
+  return sig === expected;
+}
+
 // Teacher login
 app.post('/api/auth/teacher/login', (req: Request, res: Response): void => {
   const { password } = req.body;
@@ -281,13 +303,18 @@ app.post('/api/auth/teacher/login', (req: Request, res: Response): void => {
     return;
   }
 
+  const envPassword = process.env.TEACHER_PASSWORD;
   const computedHash = hashPassword(password, serverStore.teacherSalt);
-  if (computedHash !== serverStore.teacherPasswordHash) {
+  const isMatch =
+    (envPassword && password === envPassword) ||
+    computedHash === serverStore.teacherPasswordHash;
+
+  if (!isMatch) {
     res.status(401).json({ error: '비밀번호가 올바르지 않습니다.' });
     return;
   }
 
-  const token = 'tok_' + crypto.randomBytes(16).toString('hex');
+  const token = createSignedTeacherToken();
   activeTeacherTokens.add(token);
 
   res.json({
@@ -307,8 +334,12 @@ app.post('/api/auth/teacher/setup', (req: Request, res: Response): void => {
 
   // If already set, verify current
   if (serverStore.teacherPasswordHash) {
+    const envPassword = process.env.TEACHER_PASSWORD;
     const computedCurrent = hashPassword(currentPassword || '', serverStore.teacherSalt);
-    if (computedCurrent !== serverStore.teacherPasswordHash) {
+    const isCurrentValid =
+      (envPassword && currentPassword === envPassword) ||
+      computedCurrent === serverStore.teacherPasswordHash;
+    if (!isCurrentValid) {
       res.status(401).json({ error: '현재 비밀번호가 일치하지 않습니다.' });
       return;
     }
@@ -320,7 +351,7 @@ app.post('/api/auth/teacher/setup', (req: Request, res: Response): void => {
   serverStore.teacherPasswordHash = newHash;
   saveStoreToDisk();
 
-  const token = 'tok_' + crypto.randomBytes(16).toString('hex');
+  const token = createSignedTeacherToken();
   activeTeacherTokens.add(token);
 
   res.json({
@@ -334,7 +365,7 @@ app.post('/api/auth/teacher/setup', (req: Request, res: Response): void => {
 app.get('/api/auth/teacher/check', (req: Request, res: Response): void => {
   const authHeader = req.headers.authorization;
   const token = authHeader?.replace('Bearer ', '');
-  const isValid = token ? activeTeacherTokens.has(token) : false;
+  const isValid = verifySignedTeacherToken(token);
   res.json({ isValid });
 });
 
@@ -342,7 +373,7 @@ app.get('/api/auth/teacher/check', (req: Request, res: Response): void => {
 function requireTeacherAuth(req: Request, res: Response, next: () => void) {
   const authHeader = req.headers.authorization;
   const token = authHeader?.replace('Bearer ', '');
-  if (!token || !activeTeacherTokens.has(token)) {
+  if (!verifySignedTeacherToken(token)) {
     res.status(401).json({ error: '교사 인증이 필요합니다.' });
     return;
   }
@@ -1713,6 +1744,10 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-});
+if (!IS_SERVERLESS) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+  });
+}
+
+export { app };
